@@ -19,6 +19,7 @@ import json
 import os
 import re
 import threading
+import uuid
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 SECTOR_SIZE = 512
@@ -89,6 +90,9 @@ class JobStorage:
             # 磁盘真相优先：状态里声称已救、但文件不在了的扇区剔除。
             # 内部用集合维护，避免每次写入都对不断增长的列表排序（O(n^2)）。
             state["saved"] = {i for i in saved if i < state["sector_count"]}
+            # 旧版本 job.json 没有 job_id 时补一个，用于下载时识别“任务已换”。
+            if not state.get("job_id"):
+                state["job_id"] = uuid.uuid4().hex
         else:
             state = None
 
@@ -99,6 +103,7 @@ class JobStorage:
                 "sample_sha256": None,
                 "sample_size": 0,
                 "created_at": None,
+                "job_id": None,
             }
 
         self._persist_state(state)
@@ -150,6 +155,7 @@ class JobStorage:
         saved_set = set(saved)
         missing = [i for i in range(count) if i not in saved_set]
         return {
+            "job_id": state.get("job_id"),
             "sector_count": count,
             "saved_count": len(saved),
             "missing_count": len(missing),
@@ -217,6 +223,7 @@ class JobStorage:
             os.replace(tmp_sample, self.sample_path)
             sector_count = total // SECTOR_SIZE
             state = {
+                "job_id": uuid.uuid4().hex,
                 "sector_count": sector_count,
                 "saved": set(),
                 "sample_sha256": hasher.hexdigest(),
@@ -313,6 +320,43 @@ class JobStorage:
                 return None
             with open(path, "rb") as fh:
                 return fh.read()
+
+    def missing_in_range(self, start: int, end: int) -> List[int]:
+        """返回闭区间 [start, end] 内当前仍缺失的扇区编号（升序）。"""
+        with self._lock:
+            count = self._state["sector_count"]
+            if (
+                not isinstance(start, int)
+                or not isinstance(end, int)
+                or start < 0
+                or end >= count
+                or start > end
+            ):
+                raise StorageError(
+                    f"区间越界或非法：{start}..{end}（全盘 0..{count - 1}）"
+                )
+            saved = self._state["saved"]
+            return [i for i in range(start, end + 1) if i not in saved]
+
+    def read_sample_sector(self, index: int) -> bytes:
+        """读取上传样盘（参考镜像）中的一个扇区。
+
+        仅供“网页演示/模拟恢复工具补读”使用：真实作业中对应数据应由
+        恢复工具从故障盘读出后通过 /api/sectors 上报。
+        """
+        with self._lock:
+            count = self._state["sector_count"]
+            if count == 0:
+                raise StorageError("尚无救援任务")
+            if not self._valid_index(index, count):
+                raise StorageError(f"扇区号越界：{index}")
+            sample_path = self.sample_path
+        with open(sample_path, "rb") as fh:
+            fh.seek(index * SECTOR_SIZE)
+            data = fh.read(SECTOR_SIZE)
+        if len(data) != SECTOR_SIZE:
+            raise StorageError(f"样盘扇区 {index} 读取长度不足")
+        return data
 
     # ------------------------------------------------------------------ #
     # 同进度快照：镜像 + 缺失清单

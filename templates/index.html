@@ -29,6 +29,20 @@
   pre { background: #8882; padding: .75rem; border-radius: 6px; overflow: auto;
         max-height: 16rem; font-size: .8rem; }
   .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
+  code.guid { font-size: .78rem; word-break: break-all; }
+  .sector-list { max-height: 6.5rem; overflow: auto; font-family: ui-monospace, monospace;
+                 font-size: .75rem; background: #8882; border-radius: 4px;
+                 padding: .25rem .4rem; margin-top: .25rem; min-width: 12rem;
+                 max-width: 26rem; }
+  .banner { border-radius: 6px; padding: .6rem .8rem; margin: .5rem 0; font-size: .9rem; }
+  .banner.ok { background: #2d9c5f22; border: 1px solid #2d9c5f88; }
+  .banner.warn { background: #d9930d22; border: 1px solid #d9930d88; }
+  .banner.err { background: #b3363622; border: 1px solid #b3363688; }
+  .copy-diag { font-size: .85rem; margin: .4rem 0; }
+  .copy-diag summary { cursor: pointer; }
+  .mini-btn { padding: .15rem .55rem; font-size: .78rem; border-radius: 5px; }
+  td.missing-cell { min-width: 13rem; }
+  .partition-table th, .partition-table td { vertical-align: top; }
 </style>
 </head>
 <body>
@@ -73,6 +87,28 @@
 </section>
 
 <section>
+  <h2>5. GPT 分区提取（不必等整盘救完）</h2>
+  <p class="muted">只用已救出的扇区核验主、备 GPT：分别校验表头 CRC32 与
+    128 项 × 128 字节分区项数组的 CRC32，并检查分区边界。仅一份有效就用该份；
+    两份都有效但布局不同、或都无法通过核验时停止提取并说明原因。</p>
+  <div class="row">
+    <button id="gpt-refresh-btn" class="secondary">重新分析 GPT</button>
+    <button id="demo-load-btn">一键载入 GPT 演示样盘</button>
+    <a class="btn secondary" href="/api/demo/sample.img" download>下载演示样盘</a>
+    <button id="demo-read-all-btn" class="secondary">演示：补读当前全部缺失扇区</button>
+  </div>
+  <p class="muted" style="margin:.4rem 0 0">
+    演示样盘首轮故意不救主 GPT（LBA 1–33）和 5 个分区内坏扇区：可先体验
+    「凭备表提取 → 按编号补读 → 下载分区」，再补读主 GPT 观察主备冲突。
+    “补读”会从已上传的样盘文件取数模拟恢复工具，真实作业请用第 3 节接口上报。
+  </p>
+  <div id="gpt-notice"></div>
+  <div id="gpt-panel" style="margin-top:.75rem">
+    <p class="muted">尚未分析。上传样盘后点“重新分析 GPT”，或直接“一键载入 GPT 演示样盘”。</p>
+  </div>
+</section>
+
+<section>
   <h2>危险操作</h2>
   <button class="danger" id="reset-btn">重置并删除当前任务</button>
 </section>
@@ -80,16 +116,32 @@
 <script>
 const $ = (id) => document.getElementById(id);
 
+let currentJobId = null;
+let gptData = null;
+let lastGptSig = '';
+
 async function refresh() {
   try {
     const r = await fetch('/api/job');
     if (r.status === 404) {
       $('progress').className = 'muted';
       $('progress').textContent = '尚未建立任务。';
+      if (currentJobId !== null) {
+        currentJobId = null;
+        gptData = null;
+        renderGptEmpty('任务已重置或更换，请上传/载入新样盘后重新分析 GPT。');
+      }
       return;
     }
     const j = await r.json();
     const p = j.progress;
+    if (currentJobId !== p.job_id) {
+      // 任务换了：旧的 GPT 分析与下载校验上下文全部作废。
+      currentJobId = p.job_id;
+      gptData = null;
+      lastGptSig = '';
+      loadGpt();
+    }
     const pct = p.sector_count ? (100 * p.saved_count / p.sector_count).toFixed(1) : 0;
     $('progress').className = '';
     $('progress').innerHTML = `
@@ -131,7 +183,9 @@ $('report-btn').addEventListener('click', async () => {
   if (!r.ok) { $('report-result').textContent = '失败：' + j.error; return; }
   $('report-result').textContent =
     `新写入 ${j.saved_now.length} 个，已存在 ${j.already_saved.length} 个，拒收 ${j.rejected.length} 个`;
+  lastGptSig = '';
   refresh();
+  loadGpt();
 });
 
 $('snapshot-btn').addEventListener('click', async () => {
@@ -156,8 +210,317 @@ $('reset-btn').addEventListener('click', async () => {
   $('snapshot-links').innerHTML = '';
   $('missing-preview').hidden = true;
   $('snapshot-info').textContent = '';
+  currentJobId = null;
+  gptData = null;
+  lastGptSig = '';
+  renderGptEmpty('任务已重置。请上传样盘或一键载入 GPT 演示样盘。');
   refresh();
 });
+
+// -------------------------------------------------------------------- //
+// GPT 分区提取
+// -------------------------------------------------------------------- //
+function renderGptEmpty(message) {
+  $('gpt-panel').innerHTML = `<p class="muted">${message}</p>`;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+  ));
+}
+
+function fmtSize(sectors) {
+  const bytes = sectors * 512;
+  if (bytes >= 1024 * 1024) return (bytes / 1048576).toFixed(2) + ' MiB';
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KiB';
+  return bytes + ' B';
+}
+
+async function loadGpt() {
+  if (currentJobId === null) {
+    renderGptEmpty('尚未建立任务。上传样盘后点“重新分析 GPT”，或直接“一键载入 GPT 演示样盘”。');
+    return;
+  }
+  let r;
+  try {
+    r = await fetch('/api/gpt');
+  } catch (e) { return; /* 轮询/刷新失败静默 */ }
+  if (r.status === 404) {
+    currentJobId = null;
+    renderGptEmpty('任务不存在或已重置。');
+    return;
+  }
+  const d = await r.json();
+  if (!r.ok) {
+    renderGptEmpty('GPT 分析失败：' + esc(d.error));
+    return;
+  }
+  // 内容没变就不重绘，避免打断选择/滚动。
+  const sig = JSON.stringify(d);
+  if (sig === lastGptSig) return;
+  lastGptSig = sig;
+  gptData = d;
+  renderGpt(d);
+}
+
+function copyDiagram(c) {
+  const statusZh = { valid: '有效 ✅', invalid: '核验失败 ❌', incomplete: '扇区未齐 ⏳' }[c.status] || c.status;
+  const crc = (ok) => ok === null ? '未核验' : (ok ? '通过 ✅' : '失败 ❌');
+  const reasons = (c.reasons || []).map((x) => `<li>${esc(x)}</li>`).join('');
+  const miss = (c.missing_sectors || []);
+  const missHtml = miss.length ? `
+    <div class="row" style="margin-top:.25rem">
+      <span>缺 ${miss.length} 个 GPT 扇区：</span>
+      <div class="sector-list">${miss.join(', ')}</div>
+      <button class="mini-btn secondary" data-demo-read="${esc(JSON.stringify(miss))}">演示补读这些扇区</button>
+    </div>` : '';
+  return `<details class="copy-diag" ${c.status !== 'valid' ? 'open' : ''}>
+    <summary><b>${esc(c.label)}</b>（表头 LBA ${c.header_lba}）：${statusZh}
+      ｜表头 CRC：${crc(c.header_crc_ok)}｜分区项 CRC：${crc(c.entries_crc_ok)}</summary>
+    ${reasons ? `<ul class="muted" style="margin:.3rem 0">${reasons}</ul>` : ''}
+    ${missHtml}
+  </details>`;
+}
+
+function partitionRows(parts, downloadable) {
+  if (!parts || !parts.length) {
+    return `<tr><td colspan="9" class="muted">没有可识别的非空分区项。</td></tr>`;
+  }
+  return parts.map((p) => {
+    let missingCell = '<span class="muted">—</span>';
+    if (p.complete) {
+      missingCell = '<span style="color:#2d9c5f">已收齐 ✅</span>';
+    } else if (downloadable) {
+      missingCell = `
+        <span style="color:#d9930d">缺 ${p.missing_count} 个扇区，点“下载”会再次复查并列出编号：</span>
+        <div class="sector-list">${p.missing_sectors.join(', ')}</div>
+        <button class="mini-btn secondary" data-demo-read='${esc(JSON.stringify(p.missing_sectors))}'>演示补读缺失扇区</button>`;
+    } else {
+      missingCell = `<span style="color:#d9930d">缺 ${p.missing_count} 个</span>
+        <div class="sector-list">${p.missing_sectors.join(', ')}</div>`;
+    }
+    const action = downloadable ? `
+      <button class="mini-btn" data-download="${p.index}">${p.complete ? '下载原始字节' : '检查并下载'}</button>
+      <div class="dl-msg muted" data-dl-msg="${p.index}"></div>` : '';
+    return `<tr>
+      <td>${p.index + 1}</td>
+      <td>${esc(p.name) || '<span class="muted">(无名)</span>'}</td>
+      <td><code class="guid">${esc(p.type_guid)}</code><br><span class="muted">${esc(p.type_name)}</span></td>
+      <td><code class="guid">${esc(p.unique_guid)}</code></td>
+      <td>${p.first_lba}</td>
+      <td>${p.last_lba}</td>
+      <td>${p.sector_count}<br><span class="muted">${fmtSize(p.sector_count)}</span></td>
+      <td class="missing-cell">${missingCell}</td>
+      <td>${action}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderGpt(d) {
+  let banner = '';
+  let table = '';
+  if (d.status === 'ok') {
+    banner = `<div class="banner ok"><b>可提取：采用${esc(d.source_label)}</b>。
+      ${(d.reasons || []).map(esc).join('<br>')}</div>`;
+    table = `<table class="partition-table">
+      <tr><th>项</th><th>名称</th><th>类型 GUID</th><th>分区唯一 GUID</th>
+          <th>起始 LBA</th><th>结束 LBA</th><th>大小</th><th>缺失扇区</th><th>下载</th></tr>
+      ${partitionRows(d.partitions, true)}
+    </table>`;
+  } else if (d.status === 'conflict') {
+    const diffs = (d.differences || []).map((x) => `<li>${esc(x)}</li>`).join('');
+    banner = `<div class="banner err"><b>⛔ 主、备 GPT 均有效但布局不同，已停止提取。</b>
+      <ul style="margin:.4rem 0">${diffs}</ul>
+      <div class="muted">请人工确认哪一份代表当前分区（或重新补读相关扇区）后刷新；
+      在冲突解除前本页不提供分区下载，避免把错误布局的数据交给恢复工具。</div></div>`;
+    table = `<details><summary>查看主表分区</summary>
+      <table class="partition-table">
+        <tr><th>项</th><th>名称</th><th>类型 GUID</th><th>唯一 GUID</th><th>起</th><th>止</th><th>大小</th><th>缺失</th><th></th></tr>
+        ${partitionRows(d.primary.partitions, false)}
+      </table></details>
+      <details><summary>查看备表分区</summary>
+      <table class="partition-table">
+        <tr><th>项</th><th>名称</th><th>类型 GUID</th><th>唯一 GUID</th><th>起</th><th>止</th><th>大小</th><th>缺失</th><th></th></tr>
+        ${partitionRows(d.backup.partitions, false)}
+      </table></details>`;
+  } else {
+    const cls = d.status === 'incomplete' ? 'warn' : 'err';
+    const title = d.status === 'incomplete'
+      ? '⏳ 两份 GPT 目前都无法核验通过：至少一份尚缺扇区，补读齐后重新分析。'
+      : '⛔ 主、备 GPT 都未通过核验，已停止提取。';
+    const reasons = (d.reasons || []).map(esc).join('<br>');
+    banner = `<div class="banner ${cls}"><b>${title}</b><div style="margin-top:.3rem">${reasons}</div></div>`;
+  }
+
+  $('gpt-panel').innerHTML = banner + copyDiagram(d.primary) + copyDiagram(d.backup) + table;
+
+  // 绑定动态按钮
+  $('gpt-panel').querySelectorAll('[data-demo-read]').forEach((btn) => {
+    btn.addEventListener('click', () => demoRead(JSON.parse(btn.dataset.demoRead), btn));
+  });
+  $('gpt-panel').querySelectorAll('[data-download]').forEach((btn) => {
+    btn.addEventListener('click', () => downloadPartition(Number(btn.dataset.download), btn));
+  });
+}
+
+async function demoRead(sectors, btn) {
+  const oldText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '补读中…'; }
+  try {
+    const r = await fetch('/api/demo/read', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sectors }),
+    });
+    const j = await r.json();
+    if (!r.ok) { showNotice('err', '补读失败：' + esc(j.error || r.status)); return; }
+    lastGptSig = '';
+    await refresh();
+    await loadGpt();
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = oldText; }
+  }
+}
+
+function showNotice(kind, html) {
+  $('gpt-notice').innerHTML = `<div class="banner ${kind}" id="gpt-notice-banner">${html}</div>`;
+}
+function clearNotice() { $('gpt-notice').innerHTML = ''; }
+
+async function downloadPartition(slot, btn) {
+  if (!gptData || gptData.status !== 'ok') { await loadGpt(); return; }
+  const p = gptData.partitions.find((x) => x.index === slot);
+  if (!p) { showNotice('err', '找不到该分区项，请刷新分区列表。'); loadGpt(); return; }
+  clearNotice();
+  const rowMsg = document.querySelector(`[data-dl-msg="${slot}"]`);
+  if (rowMsg) { rowMsg.textContent = '复查中…'; rowMsg.style.color = ''; }
+  const q = new URLSearchParams({
+    job_id: gptData.job_id || currentJobId || '',
+    guid: p.unique_guid,
+    type_guid: p.type_guid,
+    start: String(p.first_lba),
+    end: String(p.last_lba),
+  });
+  if (btn) { btn.disabled = true; }
+  let r;
+  try {
+    r = await fetch(`/api/gpt/partitions/${slot}/raw?` + q.toString());
+  } catch (e) {
+    showNotice('err', '下载请求失败：' + esc(String(e)));
+    if (rowMsg) rowMsg.textContent = '请求失败';
+    if (btn) btn.disabled = false;
+    return;
+  }
+  if (!r.ok) {
+    let j = {};
+    try { j = await r.json(); } catch (e) { /* 非 JSON 错误 */ }
+    if (rowMsg) rowMsg.textContent = '';
+    if (j.code === 'job_changed') {
+      showNotice('err', `任务已更换或重置，页面分区信息来自旧任务。
+        <button class="mini-btn" id="notice-reload">点此刷新整页</button>`);
+      $('notice-reload').addEventListener('click', () => location.reload());
+      currentJobId = null;
+      lastGptSig = '';
+      refresh();
+    } else if (j.code === 'partition_changed' ||
+               j.code === 'gpt_conflict' || j.code === 'gpt_invalid' ||
+               j.code === 'gpt_incomplete') {
+      showNotice('err', esc(j.error || '分区表/所选分区已变化，请刷新分区列表。') +
+        (j.code === 'gpt_conflict' ? '（主备 GPT 冲突，提取已停止）' : '') +
+        ` <button class="mini-btn secondary" id="notice-refresh-gpt">刷新分区表</button>`);
+      $('notice-refresh-gpt').addEventListener('click', () => { clearNotice(); lastGptSig = ''; loadGpt(); });
+      lastGptSig = '';
+      loadGpt();
+    } else if (j.code === 'partition_incomplete') {
+      const more = j.missing.length > 300 ? j.missing.slice(0, 300).join(', ') + ' …' : j.missing.join(', ');
+      showNotice('warn', `该分区仍缺 <b>${j.missing.length}</b> 个扇区，已在分区行列出编号，可直接补读：
+        <div class="sector-list" style="max-width:none">${esc(more)}</div>`);
+      if (rowMsg) { rowMsg.textContent = `缺 ${j.missing.length} 个扇区`; rowMsg.style.color = '#d9930d'; }
+      lastGptSig = '';
+      loadGpt();
+    } else {
+      showNotice('err', '下载被拒绝：' + esc(j.error || String(r.status)));
+    }
+    if (btn) btn.disabled = false;
+    return;
+  }
+  if (rowMsg) { rowMsg.textContent = '已开始下载 ✅'; rowMsg.style.color = '#2d9c5f'; }
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const cd = r.headers.get('Content-Disposition') || '';
+  const m = /filename="?([^"]+)"?/.exec(cd);
+  a.download = m ? m[1] : `partition-${slot + 1}-${p.first_lba}-${p.last_lba}.bin`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  if (btn) btn.disabled = false;
+}
+
+$('gpt-refresh-btn').addEventListener('click', () => { lastGptSig = ''; loadGpt(); });
+
+$('demo-load-btn').addEventListener('click', async (e) => {
+  const btn = e.target;
+  btn.disabled = true;
+  btn.textContent = '正在构造样盘并模拟首轮读盘…';
+  try {
+    const r = await fetch('/api/demo/setup', { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok) {
+      showNotice('err', esc(j.error || '演示载入失败') +
+        ' <button class="mini-btn danger" id="notice-reset">重置当前任务后重试</button>');
+      const rb = $('notice-reset');
+      if (rb) rb.addEventListener('click', async () => {
+        await fetch('/api/job', { method: 'DELETE' });
+        clearNotice();
+        currentJobId = null; lastGptSig = '';
+        renderGptEmpty('任务已重置，可再次“一键载入 GPT 演示样盘”。');
+        refresh();
+      });
+      return;
+    }
+    clearNotice();
+    currentJobId = j.progress.job_id;
+    lastGptSig = '';
+    await refresh();
+    await loadGpt();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '一键载入 GPT 演示样盘';
+  }
+});
+
+$('demo-read-all-btn').addEventListener('click', async (e) => {
+  const btn = e.target;
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '补读中…';
+  try {
+    await demoReadAll();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+});
+
+async function demoReadAll() {
+  const r = await fetch('/api/demo/read', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  const j = await r.json();
+  if (!r.ok) { showNotice('err', '补读失败：' + esc(j.error || r.status)); return; }
+  lastGptSig = '';
+  refresh();
+  loadGpt();
+}
+
+// 救援进度变化时让 GPT 缺失扇区列表保持新鲜（内容未变则不重绘）。
+setInterval(() => { if (currentJobId !== null) loadGpt(); }, 3000);
 </script>
 </body>
 </html>
